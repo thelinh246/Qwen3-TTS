@@ -41,14 +41,14 @@ def train():
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     args = parser.parse_args()
 
-    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard")
+    accelerator = Accelerator(gradient_accumulation_steps=4, mixed_precision="bf16", log_with="tensorboard", project_dir="./logs")
 
     MODEL_PATH = args.init_model_path
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
@@ -88,6 +88,12 @@ def train():
 
                 input_text_embedding = model.talker.model.text_embedding(input_text_ids) * text_embedding_mask
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+
+                # 0.6B: text_hidden_size=2048, talker hidden_size=1024 -> cắt text xuống
+                talker_hidden_size = input_codec_embedding.shape[-1]
+                if input_text_embedding.shape[-1] != talker_hidden_size:
+                    input_text_embedding = input_text_embedding[..., :talker_hidden_size]
+
                 input_codec_embedding[:, 6, :] = speaker_embedding
 
                 input_embeddings = input_text_embedding + input_codec_embedding
@@ -95,6 +101,9 @@ def train():
                 for i in range(1, 16):
                     codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
                     codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
+                    if input_embeddings.shape[-1] != codec_i_embedding.shape[-1]:
+                        pad_size = input_embeddings.shape[-1] - codec_i_embedding.shape[-1]
+                        codec_i_embedding = torch.nn.functional.pad(codec_i_embedding, (0, pad_size))
                     input_embeddings = input_embeddings + codec_i_embedding
 
                 outputs = model.talker(
@@ -107,6 +116,11 @@ def train():
                 hidden_states = outputs.hidden_states[0][-1]
                 talker_hidden_states = hidden_states[codec_mask[:, :-1]]
                 talker_codec_ids = codec_ids[codec_mask]
+
+                # Cắt về hidden_size của code_predictor (1024) nếu cần
+                sub_talker_hidden_size = model.talker.code_predictor.config.hidden_size
+                if talker_hidden_states.shape[-1] != sub_talker_hidden_size:
+                    talker_hidden_states = talker_hidden_states[..., :sub_talker_hidden_size]
 
                 sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
 
