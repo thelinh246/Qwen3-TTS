@@ -203,8 +203,14 @@ class TTSDataset(Dataset):
             codec_mask[i,   8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = True
             attention_mask[i, :8+text_ids_len+codec_ids_len] = True
         
+        # FIX: ref_mels have shape (1, time, 128) with variable time lengths.
+        # Pad all to the longest time dim before concatenating along batch dim (dim=0).
         ref_mels = [data['ref_mel'] for data in batch]
-        ref_mels = torch.cat(ref_mels,dim=0)
+        max_mel_len = max(m.shape[1] for m in ref_mels)
+        ref_mels = torch.cat(
+            [torch.nn.functional.pad(m, (0, 0, 0, max_mel_len - m.shape[1])) for m in ref_mels],
+            dim=0
+        )
 
         return {
             'input_ids':input_ids,
