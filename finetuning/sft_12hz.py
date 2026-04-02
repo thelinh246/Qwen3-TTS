@@ -59,16 +59,20 @@ def train():
     for param in qwen3tts.model.parameters():
         param.requires_grad = False
 
+    # Unfreeze embeddings TRƯỚC khi apply LoRA (sau khi wrap, path sẽ thay đổi)
+    qwen3tts.model.talker.model.codec_embedding.weight.requires_grad = True
+    qwen3tts.model.talker.model.text_embedding.weight.requires_grad = True
+
     if args.use_lora:
         accelerator.print("Using LoRA finetuning...")
 
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
-            # Target các attention projection trong talker transformer
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             lora_dropout=args.lora_dropout,
             bias="none",
+            modules_to_save=["codec_embedding", "text_embedding"],  # giữ embedding trainable sau khi wrap
         )
 
         # Apply LoRA lên talker (phần sinh audio)
@@ -77,13 +81,8 @@ def train():
 
     else:
         accelerator.print("Using full finetuning on talker...")
-        # Nếu không dùng LoRA, chỉ unfreeze talker
         for param in qwen3tts.model.talker.parameters():
             param.requires_grad = True
-
-    # Luôn train codec_embedding (speaker embedding) và text_embedding (học tiếng Việt)
-    qwen3tts.model.talker.model.codec_embedding.weight.requires_grad = True
-    qwen3tts.model.talker.model.text_embedding.weight.requires_grad = True
 
     # Log số params
     total_params = sum(p.numel() for p in qwen3tts.model.parameters())
