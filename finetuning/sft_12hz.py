@@ -24,19 +24,18 @@ def train():
     global target_speaker_embedding
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+    parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-0.6B-Base")
     parser.add_argument("--output_model_path", type=str, default="output")
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
-    # LoRA args
-    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
-    parser.add_argument("--use_lora", action="store_true", default=True, help="Use LoRA (default: True)")
-    parser.add_argument("--no_lora", dest="use_lora", action="store_false", help="Disable LoRA, full finetune")
+    parser.add_argument("--use_lora", action="store_true", default=True)
+    parser.add_argument("--no_lora", dest="use_lora", action="store_false")
     args = parser.parse_args()
 
     accelerator = Accelerator(
@@ -50,18 +49,14 @@ def train():
 
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation="sdpa",
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
-    # ── Freeze toàn bộ model trước ──────────────────────────────────────────
+    # Freeze toàn bộ model
     for param in qwen3tts.model.parameters():
         param.requires_grad = False
-
-    # Unfreeze embeddings TRƯỚC khi apply LoRA (sau khi wrap, path sẽ thay đổi)
-    qwen3tts.model.talker.model.codec_embedding.weight.requires_grad = True
-    qwen3tts.model.talker.model.text_embedding.weight.requires_grad = True
 
     if args.use_lora:
         accelerator.print("Using LoRA finetuning...")
@@ -72,24 +67,27 @@ def train():
             target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             lora_dropout=args.lora_dropout,
             bias="none",
-            modules_to_save=["codec_embedding", "text_embedding"],  # giữ embedding trainable sau khi wrap
+            # KHÔNG dùng modules_to_save vì codec/text embedding là ModuleList
         )
 
-        # Apply LoRA lên talker (phần sinh audio)
         qwen3tts.model.talker = get_peft_model(qwen3tts.model.talker, lora_config)
         qwen3tts.model.talker.print_trainable_parameters()
+
+        # Unfreeze embeddings thủ công sau khi wrap qua base_model
+        for param in qwen3tts.model.talker.base_model.model.model.codec_embedding.parameters():
+            param.requires_grad = True
+        for param in qwen3tts.model.talker.base_model.model.model.text_embedding.parameters():
+            param.requires_grad = True
 
     else:
         accelerator.print("Using full finetuning on talker...")
         for param in qwen3tts.model.talker.parameters():
             param.requires_grad = True
 
-    # Log số params
     total_params = sum(p.numel() for p in qwen3tts.model.parameters())
     trainable_params = sum(p.numel() for p in qwen3tts.model.parameters() if p.requires_grad)
-    accelerator.print(f"Total params: {total_params / 1e6:.1f}M | Trainable: {trainable_params / 1e6:.1f}M ({100 * trainable_params / total_params:.2f}%)")
+    accelerator.print(f"Total: {total_params/1e6:.1f}M | Trainable: {trainable_params/1e6:.1f}M ({100*trainable_params/total_params:.2f}%)")
 
-    # ── Dataset & DataLoader ────────────────────────────────────────────────
     train_data = open(args.train_jsonl).readlines()
     train_data = [json.loads(line) for line in train_data]
     dataset = TTSDataset(train_data, qwen3tts.processor, config)
@@ -102,7 +100,6 @@ def train():
         pin_memory=True,
     )
 
-    # Chỉ optimize trainable params
     optimizer = AdamW(
         filter(lambda p: p.requires_grad, qwen3tts.model.parameters()),
         lr=args.lr,
@@ -113,10 +110,9 @@ def train():
         qwen3tts.model, optimizer, train_dataloader
     )
 
-    num_epochs = args.num_epochs
     model.train()
 
-    for epoch in range(num_epochs):
+    for epoch in range(args.num_epochs):
         total_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
@@ -148,7 +144,6 @@ def train():
                     input_text_embedding = input_text_embedding[..., :talker_hidden_size]
 
                 input_codec_embedding[:, 6, :] = speaker_embedding
-
                 input_embeddings = input_text_embedding + input_codec_embedding
 
                 for i in range(1, 16):
@@ -179,7 +174,6 @@ def train():
                 )
 
                 loss = outputs.loss + 0.3 * sub_talker_loss
-
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
@@ -191,54 +185,43 @@ def train():
                 optimizer.zero_grad()
 
             total_loss += loss.item()
-
             if step % 10 == 0:
                 accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
 
         avg_loss = total_loss / len(train_dataloader)
-        accelerator.print(f"Epoch {epoch} complete | Avg Loss: {avg_loss:.4f}")
+        accelerator.print(f"Epoch {epoch} done | Avg Loss: {avg_loss:.4f}")
 
-        # ── Save checkpoint ─────────────────────────────────────────────────
         if accelerator.is_main_process:
             output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
             shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
 
-            # Update config
-            input_config_file = os.path.join(MODEL_PATH, "config.json")
-            output_config_file = os.path.join(output_dir, "config.json")
-            with open(input_config_file, 'r', encoding='utf-8') as f:
+            with open(os.path.join(MODEL_PATH, "config.json"), 'r', encoding='utf-8') as f:
                 config_dict = json.load(f)
             config_dict["tts_model_type"] = "custom_voice"
             talker_config = config_dict.get("talker_config", {})
             talker_config["spk_id"] = {args.speaker_name: 3000}
             talker_config["spk_is_dialect"] = {args.speaker_name: False}
             config_dict["talker_config"] = talker_config
-            with open(output_config_file, 'w', encoding='utf-8') as f:
+            with open(os.path.join(output_dir, "config.json"), 'w', encoding='utf-8') as f:
                 json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
-            # Save weights
             unwrapped_model = accelerator.unwrap_model(model)
 
-            # Nếu dùng LoRA, merge weights trước khi save
             if args.use_lora:
                 unwrapped_model.talker = unwrapped_model.talker.merge_and_unload()
 
             state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
 
-            # Drop speaker_encoder (không cần lưu)
-            keys_to_drop = [k for k in state_dict.keys() if k.startswith("speaker_encoder")]
-            for k in keys_to_drop:
+            for k in [k for k in state_dict if k.startswith("speaker_encoder")]:
                 del state_dict[k]
 
-            # Ghi speaker embedding vào codec_embedding slot 3000
             weight = state_dict['talker.model.codec_embedding.weight']
             state_dict['talker.model.codec_embedding.weight'][3000] = (
                 target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
             )
 
-            save_path = os.path.join(output_dir, "model.safetensors")
-            save_file(state_dict, save_path)
-            accelerator.print(f"Saved checkpoint to {output_dir}")
+            save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
+            accelerator.print(f"Saved to {output_dir}")
 
 
 if __name__ == "__main__":
