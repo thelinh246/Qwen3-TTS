@@ -54,6 +54,9 @@ def train():
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
+    # Lưu speaker_encoder trước khi freeze/wrap
+    speaker_encoder = qwen3tts.model.speaker_encoder
+
     # Freeze toàn bộ model
     for param in qwen3tts.model.parameters():
         param.requires_grad = False
@@ -106,18 +109,9 @@ def train():
         weight_decay=0.01
     )
 
-    # Debug: tìm speaker_encoder trong qwen3tts.model
-    print('=== qwen3tts.model named_modules ===')
-    for name, mod in qwen3tts.model.named_modules():
-        print(f'  {name}: {type(mod).__name__}')
-    import sys; sys.exit(0)
-    # Lưu reference speaker_encoder trước khi accelerator wrap
-    speaker_encoder = qwen3tts.model.speaker_encoder
-
     model, optimizer, train_dataloader = accelerator.prepare(
         qwen3tts.model, optimizer, train_dataloader
     )
-    speaker_encoder = speaker_encoder.to(accelerator.device)
 
     model.train()
 
@@ -141,7 +135,7 @@ def train():
                 talker_inner = _talker_for_cond.model          # Qwen3TTSTalkerModel: text_embedding, codec_embedding
                 talker_cond  = _talker_for_cond.code_predictor # CodePredictor: get_input_embeddings, config
 
-                speaker_embedding = speaker_encoder(
+                speaker_embedding = speaker_encoder.to(accelerator.device)(
                     ref_mels.to(accelerator.device).to(torch.bfloat16)
                 ).detach()
 
