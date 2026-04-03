@@ -126,8 +126,14 @@ def train():
                 codec_0_labels = batch['codec_0_labels']
                 codec_mask = batch['codec_mask']
 
-                speaker_embedding = model.speaker_encoder(
-                    ref_mels.to(model.device).to(model.dtype)
+                # Unwrap một lần, dùng cho tất cả
+                _model = accelerator.unwrap_model(model)
+                _talker_for_cond = _model.talker.base_model.model
+                talker_inner = _talker_for_cond.model          # Qwen3TTSTalkerModel: text_embedding, codec_embedding
+                talker_cond  = _talker_for_cond.code_predictor # CodePredictor: get_input_embeddings, config
+
+                speaker_embedding = _model.speaker_encoder(
+                    ref_mels.to(_model.device).to(_model.dtype)
                 ).detach()
 
                 if target_speaker_embedding is None:
@@ -135,20 +141,6 @@ def train():
 
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
-
-                # Kiểm tra type một lần duy nhất ở step 0
-                if step == 0 and epoch == 0:
-                    t = accelerator.unwrap_model(model).talker.base_model.model
-                    accelerator.print(f'base_model.model type: {type(t).__name__}')
-                    if hasattr(t, 'model'):
-                        accelerator.print(f'  .model type: {type(t.model).__name__}')
-                # Path xác nhận từ debug output:
-                # base_model.model = Qwen3TTSTalkerForConditionalGeneration
-                # base_model.model.model = Qwen3TTSTalkerModel (text_embedding, codec_embedding)
-                # base_model.model.code_predictor = CodePredictor
-                _talker_for_cond = accelerator.unwrap_model(model).talker.base_model.model
-                talker_inner = _talker_for_cond.model       # Qwen3TTSTalkerModel
-                talker_cond  = _talker_for_cond.code_predictor
 
                 input_text_embedding = talker_inner.text_embedding(input_text_ids) * text_embedding_mask
                 input_codec_embedding = talker_inner.codec_embedding(input_codec_ids) * codec_embedding_mask
