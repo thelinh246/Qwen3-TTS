@@ -107,9 +107,15 @@ def train():
     )
 
     # Debug: tìm speaker_encoder
-    for name, module in qwen3tts.model.named_modules():
-        if 'speaker' in name.lower():
-            print(f'Found: {name} = {type(module).__name__}')
+    print('=== qwen3tts attributes ===')
+    for attr in dir(qwen3tts):
+        if not attr.startswith('_'):
+            val = getattr(qwen3tts, attr, None)
+            if val is not None and hasattr(val, 'parameters'):
+                print(f'  qwen3tts.{attr}: {type(val).__name__}')
+    print('=== qwen3tts.model attributes ===')
+    for name, module in qwen3tts.model.named_children():
+        print(f'  {name}: {type(module).__name__}')
     import sys; sys.exit(0)
     # Lưu reference speaker_encoder trước khi accelerator wrap
     speaker_encoder = qwen3tts.model.speaker_encoder
