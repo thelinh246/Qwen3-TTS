@@ -106,6 +106,11 @@ def train():
         weight_decay=0.01
     )
 
+    # Debug: tìm speaker_encoder
+    for name, module in qwen3tts.model.named_modules():
+        if 'speaker' in name.lower():
+            print(f'Found: {name} = {type(module).__name__}')
+    import sys; sys.exit(0)
     # Lưu reference speaker_encoder trước khi accelerator wrap
     speaker_encoder = qwen3tts.model.speaker_encoder
 
