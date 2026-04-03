@@ -137,7 +137,8 @@ def train():
                 input_codec_ids = input_ids[:, :, 1]
 
                 # Lấy talker base model bất kể bị wrap bao nhiêu tầng (LoRA + accelerator)
-                talker_inner = accelerator.unwrap_model(model).talker.base_model.model.model
+                talker_cond = accelerator.unwrap_model(model).talker.base_model.model   # ForConditionalGeneration
+                talker_inner = talker_cond.model                                         # TTSTalkerModel
 
                 input_text_embedding = talker_inner.text_embedding(input_text_ids) * text_embedding_mask
                 input_codec_embedding = talker_inner.codec_embedding(input_codec_ids) * codec_embedding_mask
@@ -150,7 +151,7 @@ def train():
                 input_embeddings = input_text_embedding + input_codec_embedding
 
                 for i in range(1, 16):
-                    codec_i_embedding = talker_inner.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+                    codec_i_embedding = talker_cond.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
                     codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
                     if input_embeddings.shape[-1] != codec_i_embedding.shape[-1]:
                         pad_size = input_embeddings.shape[-1] - codec_i_embedding.shape[-1]
@@ -168,11 +169,10 @@ def train():
                 talker_hidden_states = hidden_states[codec_mask[:, :-1]]
                 talker_codec_ids = codec_ids[codec_mask]
 
-                sub_talker_hidden_size = talker_inner.code_predictor.config.hidden_size
+                sub_talker_hidden_size = talker_cond.code_predictor.config.hidden_size
                 if talker_hidden_states.shape[-1] != sub_talker_hidden_size:
                     talker_hidden_states = talker_hidden_states[..., :sub_talker_hidden_size]
 
-                talker_cond = accelerator.unwrap_model(model).talker.base_model.model
                 sub_talker_logits, sub_talker_loss = talker_cond.forward_sub_talker_finetune(
                     talker_codec_ids, talker_hidden_states
                 )
