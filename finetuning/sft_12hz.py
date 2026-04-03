@@ -137,7 +137,7 @@ def train():
                 input_codec_ids = input_ids[:, :, 1]
 
                 # Lấy talker base model bất kể bị wrap bao nhiêu tầng (LoRA + accelerator)
-                talker_inner = accelerator.unwrap_model(model).talker.base_model.model
+                talker_inner = accelerator.unwrap_model(model).talker.base_model.model.model
 
                 input_text_embedding = talker_inner.text_embedding(input_text_ids) * text_embedding_mask
                 input_codec_embedding = talker_inner.codec_embedding(input_codec_ids) * codec_embedding_mask
@@ -172,7 +172,8 @@ def train():
                 if talker_hidden_states.shape[-1] != sub_talker_hidden_size:
                     talker_hidden_states = talker_hidden_states[..., :sub_talker_hidden_size]
 
-                sub_talker_logits, sub_talker_loss = talker_inner.forward_sub_talker_finetune(
+                talker_cond = accelerator.unwrap_model(model).talker.base_model.model
+                sub_talker_logits, sub_talker_loss = talker_cond.forward_sub_talker_finetune(
                     talker_codec_ids, talker_hidden_states
                 )
 
