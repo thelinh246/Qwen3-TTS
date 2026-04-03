@@ -73,11 +73,11 @@ def train():
         qwen3tts.model.talker = get_peft_model(qwen3tts.model.talker, lora_config)
         qwen3tts.model.talker.print_trainable_parameters()
 
-        # Unfreeze embeddings thủ công sau khi wrap qua base_model
-        for param in qwen3tts.model.talker.base_model.model.codec_embedding.parameters():
-            param.requires_grad = True
-        for param in qwen3tts.model.talker.base_model.model.text_embedding.parameters():
-            param.requires_grad = True
+        # Unfreeze embeddings bằng cách tìm theo tên - không phụ thuộc vào path
+        for name, param in qwen3tts.model.talker.named_parameters():
+            if 'codec_embedding' in name or 'text_embedding' in name:
+                param.requires_grad = True
+                accelerator.print(f"Unfrozen: {name}")
 
     else:
         accelerator.print("Using full finetuning on talker...")
