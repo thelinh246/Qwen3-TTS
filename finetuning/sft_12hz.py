@@ -106,9 +106,13 @@ def train():
         weight_decay=0.01
     )
 
+    # Lưu reference speaker_encoder trước khi accelerator wrap
+    speaker_encoder = qwen3tts.model.speaker_encoder
+
     model, optimizer, train_dataloader = accelerator.prepare(
         qwen3tts.model, optimizer, train_dataloader
     )
+    speaker_encoder = speaker_encoder.to(accelerator.device)
 
     model.train()
 
@@ -132,8 +136,8 @@ def train():
                 talker_inner = _talker_for_cond.model          # Qwen3TTSTalkerModel: text_embedding, codec_embedding
                 talker_cond  = _talker_for_cond.code_predictor # CodePredictor: get_input_embeddings, config
 
-                speaker_embedding = _model.speaker_encoder(
-                    ref_mels.to(_model.device).to(_model.dtype)
+                speaker_embedding = speaker_encoder(
+                    ref_mels.to(accelerator.device).to(torch.bfloat16)
                 ).detach()
 
                 if target_speaker_embedding is None:
