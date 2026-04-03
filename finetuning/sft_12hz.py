@@ -136,10 +136,19 @@ def train():
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
-                # Path xác nhận từ debug output
-                _talker_base = accelerator.unwrap_model(model).talker.base_model.model
-                talker_inner = _talker_base.model        # text_embedding, codec_embedding
-                talker_cond  = _talker_base.code_predictor  # get_input_embeddings, forward_sub_talker_finetune
+                # Kiểm tra type một lần duy nhất ở step 0
+                if step == 0 and epoch == 0:
+                    t = accelerator.unwrap_model(model).talker.base_model.model
+                    accelerator.print(f'base_model.model type: {type(t).__name__}')
+                    if hasattr(t, 'model'):
+                        accelerator.print(f'  .model type: {type(t.model).__name__}')
+                # Path xác nhận từ debug output:
+                # base_model.model = Qwen3TTSTalkerForConditionalGeneration
+                # base_model.model.model = Qwen3TTSTalkerModel (text_embedding, codec_embedding)
+                # base_model.model.code_predictor = CodePredictor
+                _talker_for_cond = accelerator.unwrap_model(model).talker.base_model.model
+                talker_inner = _talker_for_cond.model       # Qwen3TTSTalkerModel
+                talker_cond  = _talker_for_cond.code_predictor
 
                 input_text_embedding = talker_inner.text_embedding(input_text_ids) * text_embedding_mask
                 input_codec_embedding = talker_inner.codec_embedding(input_codec_ids) * codec_embedding_mask
@@ -174,7 +183,7 @@ def train():
                 if talker_hidden_states.shape[-1] != sub_talker_hidden_size:
                     talker_hidden_states = talker_hidden_states[..., :sub_talker_hidden_size]
 
-                sub_talker_logits, sub_talker_loss = _talker_base.forward_sub_talker_finetune(
+                sub_talker_logits, sub_talker_loss = _talker_for_cond.forward_sub_talker_finetune(
                     talker_codec_ids, talker_hidden_states
                 )
 
@@ -213,12 +222,17 @@ def train():
             unwrapped_model = accelerator.unwrap_model(model)
 
             if args.use_lora:
-                unwrapped_model.talker = unwrapped_model.talker.merge_and_unload()
-
-            state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
-
-            for k in [k for k in state_dict if k.startswith("speaker_encoder")]:
-                del state_dict[k]
+                import copy
+                # Deep copy để không làm hỏng model đang train
+                talker_copy = copy.deepcopy(unwrapped_model.talker)
+                talker_merged = talker_copy.merge_and_unload()
+                state_dict = {k: v.detach().to("cpu") for k, v in talker_merged.state_dict().items()}
+                # Thêm prefix talker. và các key khác (speaker_encoder không cần save)
+                state_dict = {"talker." + k: v for k, v in state_dict.items()}
+            else:
+                state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
+                for k in [k for k in state_dict if k.startswith("speaker_encoder")]:
+                    del state_dict[k]
 
             weight = state_dict['talker.model.codec_embedding.weight']
             state_dict['talker.model.codec_embedding.weight'][3000] = (
