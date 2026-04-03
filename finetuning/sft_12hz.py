@@ -74,9 +74,9 @@ def train():
         qwen3tts.model.talker.print_trainable_parameters()
 
         # Unfreeze embeddings thủ công sau khi wrap qua base_model
-        for param in qwen3tts.model.talker.base_model.model.model.codec_embedding.parameters():
+        for param in qwen3tts.model.talker.base_model.model.codec_embedding.parameters():
             param.requires_grad = True
-        for param in qwen3tts.model.talker.base_model.model.model.text_embedding.parameters():
+        for param in qwen3tts.model.talker.base_model.model.text_embedding.parameters():
             param.requires_grad = True
 
     else:
@@ -136,8 +136,8 @@ def train():
                 input_text_ids = input_ids[:, :, 0]
                 input_codec_ids = input_ids[:, :, 1]
 
-                input_text_embedding = model.talker.base_model.model.model.text_embedding(input_text_ids) * text_embedding_mask
-                input_codec_embedding = model.talker.base_model.model.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+                input_text_embedding = model.talker.base_model.model.text_embedding(input_text_ids) * text_embedding_mask
+                input_codec_embedding = model.talker.base_model.model.codec_embedding(input_codec_ids) * codec_embedding_mask
 
                 talker_hidden_size = input_codec_embedding.shape[-1]
                 if input_text_embedding.shape[-1] != talker_hidden_size:
