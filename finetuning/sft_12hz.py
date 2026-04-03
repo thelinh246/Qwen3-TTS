@@ -72,6 +72,15 @@ def train():
 
         qwen3tts.model.talker = get_peft_model(qwen3tts.model.talker, lora_config)
         qwen3tts.model.talker.print_trainable_parameters()
+        # === DEBUG: in cấu trúc model, xóa sau khi xác nhận ===
+        accelerator.print('=== MODEL STRUCTURE ===')
+        for name, module in qwen3tts.model.talker.named_modules():
+            if any(x in name for x in ['text_embedding', 'codec_embedding', 'code_predictor', 'forward_sub']):
+                accelerator.print(f'  {name}: {type(module).__name__}')
+        accelerator.print('=== END STRUCTURE ===')
+        import sys; sys.exit(0)
+        # === END DEBUG ===
+
 
         # Unfreeze embeddings bằng cách tìm theo tên - không phụ thuộc vào path
         for name, param in qwen3tts.model.talker.named_parameters():
