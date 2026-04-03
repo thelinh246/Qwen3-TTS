@@ -47,6 +47,17 @@ def train():
 
     MODEL_PATH = args.init_model_path
 
+    # Patch config để đảm bảo speaker_encoder được khởi tạo
+    import json, os
+    config_path = os.path.join(MODEL_PATH, 'config.json')
+    with open(config_path) as f:
+        _cfg = json.load(f)
+    if _cfg.get('tts_model_type') != 'base':
+        accelerator.print(f"Patching tts_model_type: {_cfg.get('tts_model_type')} -> base")
+        _cfg['tts_model_type'] = 'base'
+        with open(config_path, 'w') as f:
+            json.dump(_cfg, f, indent=2, ensure_ascii=False)
+
     qwen3tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
         dtype=torch.bfloat16,
