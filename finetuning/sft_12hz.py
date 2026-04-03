@@ -54,6 +54,13 @@ def train():
     )
     config = AutoConfig.from_pretrained(MODEL_PATH)
 
+    # Lưu speaker_encoder trước khi prepare (accelerator wrap sẽ làm mất attribute này)
+    speaker_encoder = qwen3tts.model.speaker_encoder
+    assert speaker_encoder is not None, "speaker_encoder is None! Check model config."
+    speaker_encoder.eval()  # Không train speaker_encoder
+    for param in speaker_encoder.parameters():
+        param.requires_grad = False
+
     # Freeze toàn bộ model
     for param in qwen3tts.model.parameters():
         param.requires_grad = False
@@ -106,14 +113,6 @@ def train():
         weight_decay=0.01
     )
 
-    # Debug: tìm speaker_encoder trong qwen3tts.model
-    print('=== qwen3tts.model named_modules ===')
-    for name, mod in qwen3tts.model.named_modules():
-        print(f'  {name}: {type(mod).__name__}')
-    import sys; sys.exit(0)
-    # Lưu reference speaker_encoder trước khi accelerator wrap
-    speaker_encoder = qwen3tts.model.speaker_encoder
-
     model, optimizer, train_dataloader = accelerator.prepare(
         qwen3tts.model, optimizer, train_dataloader
     )
@@ -141,9 +140,10 @@ def train():
                 talker_inner = _talker_for_cond.model          # Qwen3TTSTalkerModel: text_embedding, codec_embedding
                 talker_cond  = _talker_for_cond.code_predictor # CodePredictor: get_input_embeddings, config
 
-                speaker_embedding = speaker_encoder(
-                    ref_mels.to(accelerator.device).to(torch.bfloat16)
-                ).detach()
+                with torch.no_grad():
+                    speaker_embedding = speaker_encoder(
+                        ref_mels.to(accelerator.device).to(torch.bfloat16)
+                    )[0].detach()
 
                 if target_speaker_embedding is None:
                     target_speaker_embedding = speaker_embedding
