@@ -79,14 +79,14 @@ def parse_args():
                         "Nếu chỉ muốn warm-start (không tiếp tục optimizer), dùng --init_model_path thay vì flag này.")
 
     # Training hyperparams
-    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--lr", type=float, default=2e-6,
                    help="LR được validate bởi cộng đồng. KHÔNG dùng 2e-5 (sinh noise).")
     p.add_argument("--num_epochs", type=int, default=15,
                    help="Stage 1 cần nhiều epoch hơn Stage 2. "
                         "Val loss tăng = overfitting, dừng lại.")
     p.add_argument("--warmup_steps", type=int, default=200)
-    p.add_argument("--grad_accum_steps", type=int, default=4)
+    p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--save_every_n_epochs", type=int, default=2)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
