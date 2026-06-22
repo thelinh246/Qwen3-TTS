@@ -262,7 +262,17 @@ class TTSDataset(Dataset):
             codec_mask[i, 8+text_ids_len-1:8+text_ids_len-1+codec_ids_len] = True
             attention_mask[i, :8+text_ids_len+codec_ids_len] = True
 
-        ref_mels = torch.cat([data["ref_mel"] for data in batch], dim=0)
+        # FIX 4 — ref_mel có độ dài time frames khác nhau giữa các sample (multi-speaker)
+        # Gốc: torch.cat(...) crash với "Sizes must match except in dimension 0"
+        #       vì mỗi ref_audio có thời lượng khác nhau → mel frames khác nhau.
+        # Fix: pad zeros về max_T trước khi cat.
+        #      Speaker encoder chỉ đọc phần đầu (tiếng nói thực), padding cuối không ảnh hưởng.
+        ref_mels_list = [data["ref_mel"] for data in batch]
+        max_T = max(m.shape[1] for m in ref_mels_list)
+        ref_mels = torch.cat([
+            torch.nn.functional.pad(m, (0, 0, 0, max_T - m.shape[1]))
+            for m in ref_mels_list
+        ], dim=0)
 
         return {
             "input_ids":            input_ids,
