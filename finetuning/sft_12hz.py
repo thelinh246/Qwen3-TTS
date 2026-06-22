@@ -170,10 +170,29 @@ def build_input_embeddings(
     """
     with torch.no_grad():
         # Lấy speaker embedding từ ref_mel của mỗi sample trong batch
-        # Stage 1: không cache, mỗi batch có embedding khác nhau
-        speaker_embedding = speaker_encoder(
-            ref_mels.to(device).to(torch.bfloat16)
-        )[0].detach()  # [B, D]
+        raw = speaker_encoder(ref_mels.to(device).to(torch.bfloat16))
+
+        # BUG FIX: speaker_encoder có thể trả về tuple HOẶC tensor trực tiếp.
+        # - Nếu trả tuple (tensor, ...): [0] → [B, D] ✓
+        # - Nếu trả tensor [B, D] trực tiếp: [0] → [D] (chỉ sample đầu!) ✗
+        #   → for loop chạy theo dim D (~512) thay vì dim B (~4) → IndexError
+        # Fix: kiểm tra kiểu trả về, sau đó đảm bảo shape luôn là [B, D].
+        if isinstance(raw, (tuple, list)):
+            spk = raw[0].detach()   # tuple → lấy phần tử đầu: [B, D]
+        else:
+            spk = raw.detach()      # tensor trực tiếp: [B, D]
+
+        # Đảm bảo shape [B, D] bất kể encoder trả về gì
+        B = input_ids.shape[0]
+        if spk.dim() == 1:
+            # [D] → expand thành [B, D] (một embedding cho tất cả batch items)
+            spk = spk.unsqueeze(0).expand(B, -1)
+        elif spk.dim() == 3:
+            # [B, T, D] → pool theo T → [B, D]
+            spk = spk.mean(dim=1)
+        # spk.shape == [B, D] ✓
+
+        speaker_embedding = spk  # [B, D]
 
     # Text embedding
     input_text_embedding = talker_inner.text_embedding(input_ids[:, :, 0])
@@ -194,9 +213,11 @@ def build_input_embeddings(
         input_text_embedding = input_text_embedding[..., :talker_hidden_size]
 
     # Inject speaker embedding tại vị trí 6 trong sequence (speaker conditioning slot)
-    # Stage 1: inject per-sample (KHÔNG dùng global target_speaker_embedding)
-    for b in range(speaker_embedding.shape[0]):
-        input_codec_embedding[b, 6, :] = speaker_embedding[b].to(input_codec_embedding.dtype)
+    # Dùng direct slice assignment thay vì for loop:
+    #   input_codec_embedding[:, 6, :] là [B, D]
+    #   speaker_embedding là [B, D]
+    #   → mỗi sample nhận đúng embedding của mình, không cần vòng lặp
+    input_codec_embedding[:, 6, :] = speaker_embedding.to(input_codec_embedding.dtype)
 
     # Kết hợp text + codec embeddings
     input_embeddings = input_text_embedding + input_codec_embedding
