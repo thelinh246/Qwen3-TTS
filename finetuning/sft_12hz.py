@@ -97,7 +97,7 @@ def parse_args():
                         "Cần: pip install flash-attn --no-build-isolation")
 
     # Loss weight
-    p.add_argument("--sub_talker_loss_weight", type=float, default=0.3,
+    p.add_argument("--sub_talker_loss_weight", type=float, default=0.0,
                    help="Trọng số loss của codec residuals (sub-talker).")
 
     return p.parse_args()
