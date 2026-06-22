@@ -268,10 +268,16 @@ def compute_loss(
     )
 
     # Sub-talker loss (codec residuals 1-15)
-    # Lấy hidden states của last transformer layer
-    # outputs.hidden_states là tuple (embedding, layer1, ..., lastLayer)
-    # [-1] = last layer output, shape [B, seq-1, hidden]
-    last_hidden = outputs.hidden_states[-1]   # [B, seq-1, hidden]
+    # Qwen3TTS talker trả về hidden_states với cấu trúc LỒNG NHAU:
+    #   outputs.hidden_states    = (inner_tuple, None, ...)
+    #   outputs.hidden_states[0] = (emb, layer1, ..., last_layer)  ← tuple các layer
+    #   outputs.hidden_states[-1]= None  ← đây là lý do crash!
+    # Fix: dùng [0][-1] để lấy last layer của inner tuple, shape [B, seq-1, hidden]
+    inner = outputs.hidden_states[0]   # tuple các layer hidden states
+    if isinstance(inner, (tuple, list)):
+        last_hidden = inner[-1]        # last transformer layer [B, seq-1, hidden]
+    else:
+        last_hidden = inner            # fallback nếu không phải tuple
 
     # BUG FIX: dùng codec_mask[:, :-1] (seq-1) nhất quán với last_hidden
     talker_hidden_states = last_hidden[codec_mask[:, :-1]]          # [N, hidden]
