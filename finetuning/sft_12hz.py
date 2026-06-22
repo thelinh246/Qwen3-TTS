@@ -73,6 +73,10 @@ def parse_args():
                         "Mỗi dòng nên là một speaker khác nhau để học ngôn ngữ tốt hơn.")
     p.add_argument("--val_jsonl", type=str, default=None,
                    help="JSONL validation (khuyến khích dùng để theo dõi overfitting).")
+    p.add_argument("--resume_from_checkpoint", type=str, default=None,
+                   help="Thư mục checkpoint để resume training (vd: output_stage1_vi/checkpoint-epoch-10). "
+                        "Tự động load model weights + optimizer + scheduler + global_step. "
+                        "Nếu chỉ muốn warm-start (không tiếp tục optimizer), dùng --init_model_path thay vì flag này.")
 
     # Training hyperparams
     p.add_argument("--batch_size", type=int, default=4)
@@ -87,6 +91,10 @@ def parse_args():
     p.add_argument("--save_every_n_epochs", type=int, default=2)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--attn_impl", type=str, default="sdpa",
+                   choices=["sdpa", "flash_attention_2", "eager"],
+                   help="flash_attention_2 nhanh hơn ~40%% trên A100/H100. "
+                        "Cần: pip install flash-attn --no-build-isolation")
 
     # Loss weight
     p.add_argument("--sub_talker_loss_weight", type=float, default=0.3,
@@ -261,37 +269,47 @@ def compute_loss(
     return total_loss, main_loss, sub_talker_loss
 
 
-def save_checkpoint(accelerator, model, args, config_dict, epoch):
-    """Lưu checkpoint cho Stage 1 (không ghi speaker-specific info).
+def save_checkpoint(
+    accelerator, model, optimizer, scheduler,
+    args, config_dict, epoch, global_step, best_val_loss,
+):
+    """Lưu checkpoint sau mỗi epoch.
 
-    Stage 1 khác Stage 2 ở chỗ:
-    - KHÔNG ghi spk_id vào config (không phải single-speaker model)
-    - KHÔNG ghi speaker embedding vào codec_embedding.weight[slot]
-    - Lưu toàn bộ talker state_dict để Stage 2 có thể tiếp tục từ đây
+    Lưu 2 thứ:
+      - model.safetensors : model weights cho inference
+      - training_state.pt : optimizer + scheduler + step cho resume training
     """
     output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
     os.makedirs(output_dir, exist_ok=True)
     shutil.copytree(args.init_model_path, output_dir, dirs_exist_ok=True)
 
-    # Cập nhật config: đánh dấu Stage 1, không ghi speaker info
     cfg = dict(config_dict)
     cfg["tts_model_type"] = "base"
-    cfg["stage1_vi"] = True  # metadata để nhận biết checkpoint Stage 1
+    cfg["stage1_vi"] = True
     with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 
     unwrapped = accelerator.unwrap_model(model)
-
-    # Stage 1 không dùng LoRA (full finetuning), nên lưu trực tiếp
-    # Loại bỏ speaker_encoder vì không thay đổi trong Stage 1
     state_dict = {
         k: v.detach().cpu()
         for k, v in unwrapped.state_dict().items()
         if not k.startswith("speaker_encoder")
     }
-
     save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
-    accelerator.print(f"[Checkpoint] Epoch {epoch} -> {output_dir}")
+
+    # Lưu training state để resume đúng cách (optimizer + scheduler + step)
+    # Thiếu phần này → khi resume optimizer khởi động lại từ đầu (mất momentum/variance)
+    training_state = {
+        "epoch":                epoch,
+        "global_step":          global_step,
+        "best_val_loss":        best_val_loss,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "args_lr":              args.lr,
+    }
+    torch.save(training_state, os.path.join(output_dir, "training_state.pt"))
+
+    accelerator.print(f"[Checkpoint] Epoch {epoch}, step {global_step} -> {output_dir}")
     return output_dir
 
 
@@ -369,7 +387,7 @@ def train():
     qwen3tts = Qwen3TTSModel.from_pretrained(
         args.init_model_path,
         dtype=torch.bfloat16,
-        attn_implementation="sdpa",
+        attn_implementation=args.attn_impl,
     )
     config = AutoConfig.from_pretrained(args.init_model_path)
 
@@ -467,13 +485,35 @@ def train():
 
     global_step = 0
     best_val_loss = float("inf")
+    resume_epoch = 0
+
+    # ── 6b. Resume từ checkpoint (load optimizer + scheduler + step) ──
+    if args.resume_from_checkpoint:
+        state_path = os.path.join(args.resume_from_checkpoint, "training_state.pt")
+        if os.path.exists(state_path):
+            state = torch.load(state_path, map_location="cpu")
+            resume_epoch  = state["epoch"] + 1          # bắt đầu từ epoch kế tiếp
+            global_step   = state["global_step"]
+            best_val_loss = state.get("best_val_loss", float("inf"))
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+            scheduler.load_state_dict(state["scheduler_state_dict"])
+            accelerator.print(
+                f"[Resume] Loaded checkpoint từ {args.resume_from_checkpoint} | "
+                f"epoch={state['epoch']}, step={global_step}, "
+                f"best_val={best_val_loss:.4f}, saved_lr={state.get('args_lr', '?')}"
+            )
+        else:
+            accelerator.print(
+                f"[Resume] Không tìm thấy training_state.pt trong {args.resume_from_checkpoint}. "
+                "Chỉ dùng model weights (optimizer sẽ khởi động từ đầu)."
+            )
 
     # Unwrap một lần ngoài loop để tối ưu hiệu năng
     _model = accelerator.unwrap_model(model)
     talker_for_cond, talker_inner, talker_cond = get_talker_inner(_model, use_lora=False)
 
     # ── 7. Training loop ─────────────────────────────────────────
-    for epoch in range(args.num_epochs):
+    for epoch in range(resume_epoch, args.num_epochs):
         model.train()
         ep_total = ep_main = ep_sub = 0.0
 
@@ -561,12 +601,19 @@ def train():
 
         # Save checkpoint
         if accelerator.is_main_process and (epoch + 1) % args.save_every_n_epochs == 0:
-            ckpt = save_checkpoint(accelerator, model, args, config_dict, epoch)
+            ckpt = save_checkpoint(
+                accelerator, model, optimizer, scheduler,
+                args, config_dict, epoch, global_step, best_val_loss,
+            )
             accelerator.print(f"[Save] Checkpoint saved: {ckpt}")
 
     # Save final checkpoint
     if accelerator.is_main_process:
-        ckpt = save_checkpoint(accelerator, model, args, config_dict, epoch="final")
+        ckpt = save_checkpoint(
+            accelerator, model, optimizer, scheduler,
+            args, config_dict, epoch="final", global_step=global_step,
+            best_val_loss=best_val_loss,
+        )
         accelerator.print(f"[Done] Final checkpoint: {ckpt}")
 
     accelerator.print("Stage 1 training complete.")
