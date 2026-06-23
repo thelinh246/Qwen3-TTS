@@ -80,7 +80,7 @@ def parse_args():
 
     # Training hyperparams
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=2e-6,
+    p.add_argument("--lr", type=float, default=1e-6,
                    help="LR được validate bởi cộng đồng. KHÔNG dùng 2e-5 (sinh noise).")
     p.add_argument("--num_epochs", type=int, default=15,
                    help="Stage 1 cần nhiều epoch hơn Stage 2. "
