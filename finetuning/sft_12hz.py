@@ -1,653 +1,344 @@
 # coding=utf-8
-# Stage 1: Dạy Qwen3-TTS học tiếng Việt (ngôn ngữ + phát âm)
-# Mục tiêu: học text->codec mapping cho tiếng Việt, KHÔNG phải clone giọng đọc.
+# Copyright 2026 The Alibaba Qwen team.
+# SPDX-License-Identifier: Apache-2.0
 #
-# ═══════════════════════════════════════════════════════════════
-#  BUG FIXES áp dụng từ cộng đồng (so với official sft_12hz.py)
-# ═══════════════════════════════════════════════════════════════
-#  #1  Double label-shift (PR #178, CHƯA merge upstream)
-#      Nguyên nhân: code gốc shift labels thủ công (labels[:, 1:]) rồi
-#      truyền vào HF ForCausalLM vốn shift thêm một lần nữa → double shift.
-#      Triệu chứng: giọng đọc nhanh dần sau mỗi epoch đến mức không nghe được.
-#      Fix: bỏ labels= khỏi model.talker(), tính loss bằng F.cross_entropy.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#  #2  Thiếu text_projection (PR #188, ĐÃ merge tại commit 680d4e9)
-#      Nguyên nhân: inference dùng text_projection sau text_embedding,
-#      nhưng training không có bước này → train/infer mismatch.
-#      Triệu chứng: crash hoặc embedding sai silently trên 1.7B.
-#      Fix: gọi _talker_for_cond.text_projection() nếu tồn tại.
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-#  #3  LR mặc định quá cao (2e-5 → dùng 2e-6)
-#      Nguyên nhân: LR cao → không hội tụ, sinh pure noise, không có EOS.
-#
-# ═══════════════════════════════════════════════════════════════
-#  SO SÁNH Stage 1 (học ngôn ngữ) vs Stage 2 (clone voice)
-# ═══════════════════════════════════════════════════════════════
-#  Stage 1 (file này):
-#   - Dataset: nhiều speaker, nhiều câu tiếng Việt đa dạng
-#   - ref_audio: lấy từ chính mẫu đó (mỗi sample một ref khác nhau)
-#   - KHÔNG lưu speaker embedding vào codec_embedding.weight[3000]
-#   - KHÔNG ghi spk_id vào config
-#   - Huấn luyện: toàn bộ talker (text_embedding + transformer)
-#
-#  Stage 2 (train_stage2_voice.py):
-#   - Dataset: 10-30 phút audio một người nói duy nhất
-#   - ref_audio: CỐ ĐỊNH một file ref của người đó
-#   - LƯU speaker embedding vào codec_embedding.weight[spk_slot]
-#   - Ghi spk_id vào config để inference dùng generate_custom_voice()
-#   - Bắt đầu từ checkpoint Stage 1
-# ═══════════════════════════════════════════════════════════════
-
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import argparse
-import copy
 import json
+import math
 import os
+import re
 import shutil
+from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import set_seed
 from dataset import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from safetensors.torch import save_file
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
-from transformers import AutoConfig
+from transformers import AutoConfig, get_scheduler
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
 
-# ──────────────────────────────────────────────────────────────
-# Args
-# ──────────────────────────────────────────────────────────────
-def parse_args():
-    p = argparse.ArgumentParser(description="Stage 1: Qwen3-TTS Vietnamese language learning")
+target_speaker_embedding = None
+def train():
+    global target_speaker_embedding
 
-    # Paths
-    p.add_argument("--init_model_path", type=str,
-                   default="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-                   help="Model gốc để finetune. Dùng 1.7B cho kết quả tốt hơn.")
-    p.add_argument("--output_model_path", type=str, default="output_stage1_vi")
-    p.add_argument("--train_jsonl", type=str, required=True,
-                   help="JSONL với các trường: text (tiếng Việt), audio, ref_audio. "
-                        "Mỗi dòng nên là một speaker khác nhau để học ngôn ngữ tốt hơn.")
-    p.add_argument("--val_jsonl", type=str, default=None,
-                   help="JSONL validation (khuyến khích dùng để theo dõi overfitting).")
-    p.add_argument("--resume_from_checkpoint", type=str, default=None,
-                   help="Thư mục checkpoint để resume training (vd: output_stage1_vi/checkpoint-epoch-10). "
-                        "Tự động load model weights + optimizer + scheduler + global_step. "
-                        "Nếu chỉ muốn warm-start (không tiếp tục optimizer), dùng --init_model_path thay vì flag này.")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+    parser.add_argument("--output_model_path", type=str, default="output")
+    parser.add_argument("--train_jsonl", type=str, required=True)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--num_epochs", type=int, default=3)
+    parser.add_argument("--speaker_name", type=str, default="speaker_test")
+    parser.add_argument("--save_interval", type=int, default=1, help="Save a checkpoint every N epochs.")
+    parser.add_argument("--save_last/--no-save_last", dest="save_last", default=True, action=argparse.BooleanOptionalAction, help="Always save the final epoch checkpoint.")
+    parser.add_argument("--log_interval", type=int, default=10, help="Log loss every N steps.")
+    parser.add_argument("--logging_dir", type=str, default=None, help="Accelerate logging directory (e.g., runs/run1/logs).")
+    parser.add_argument(
+        "--resume/--no-resume",
+        dest="resume",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Resume from the latest checkpoint in output_model_path if available.",
+    )
+    parser.add_argument(
+        "--accelerate-trackers/--no-accelerate-trackers",
+        dest="accelerate_trackers",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Enable Accelerate tracker integrations (default: disabled).",
+    )
+    parser.add_argument(
+        "--flash-attn/--no-flash-attn",
+        dest="flash_attn",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Enable FlashAttention-2 (default: enabled).",
+    )
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="cosine",
+        choices=["cosine", "linear", "constant", "constant_with_warmup"],
+        help="Learning rate scheduler type.",
+    )
+    parser.add_argument("--warmup_steps", type=int, default=0, help="Number of warmup steps.")
+    parser.add_argument("--warmup_ratio", type=float, default=0.0, help="Warmup ratio of total steps (overrides warmup_steps if > 0).")
+    args = parser.parse_args()
 
-    # Training hyperparams
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1e-6,
-                   help="LR được validate bởi cộng đồng. KHÔNG dùng 2e-5 (sinh noise).")
-    p.add_argument("--num_epochs", type=int, default=15,
-                   help="Stage 1 cần nhiều epoch hơn Stage 2. "
-                        "Val loss tăng = overfitting, dừng lại.")
-    p.add_argument("--warmup_steps", type=int, default=200)
-    p.add_argument("--grad_accum_steps", type=int, default=1)
-    p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--save_every_n_epochs", type=int, default=2)
-    p.add_argument("--max_grad_norm", type=float, default=1.0)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--attn_impl", type=str, default="sdpa",
-                   choices=["sdpa", "flash_attention_2", "eager"],
-                   help="flash_attention_2 nhanh hơn ~40%% trên A100/H100. "
-                        "Cần: pip install flash-attn --no-build-isolation")
-
-    # Loss weight
-    p.add_argument("--sub_talker_loss_weight", type=float, default=0.0,
-                   help="Trọng số loss của codec residuals (sub-talker).")
-
-    return p.parse_args()
-
-
-# ──────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────
-def patch_and_load_config(model_path, accelerator):
-    """Đảm bảo tts_model_type=base để khởi tạo speaker_encoder.
-    Chỉ thực hiện ở main process để tránh race condition khi multi-GPU."""
-    config_path = os.path.join(model_path, "config.json")
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-
-    if cfg.get("tts_model_type") != "base":
-        if accelerator.is_main_process:
-            accelerator.print(
-                f"[Config] Patching tts_model_type: {cfg.get('tts_model_type')} -> base"
+    accel_logging_dir = args.logging_dir or str(Path(args.output_model_path) / "logs")
+    grad_accum_steps = 4
+    if args.accelerate_trackers:
+        try:
+            from accelerate import ProjectConfiguration  # type: ignore
+            project_config = ProjectConfiguration(project_dir=str(args.output_model_path), logging_dir=accel_logging_dir)
+            accelerator = Accelerator(
+                gradient_accumulation_steps=grad_accum_steps,
+                mixed_precision="bf16",
+                log_with="tensorboard",
+                project_config=project_config,
             )
-            cfg["tts_model_type"] = "base"
-            with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2, ensure_ascii=False)
-        # Các process khác chờ main process ghi xong
-        accelerator.wait_for_everyone()
-        # Reload sau khi patch
+        except Exception:
+            # Older accelerate: fall back without tracker integration.
+            accelerator = Accelerator(
+                gradient_accumulation_steps=grad_accum_steps,
+                mixed_precision="bf16",
+            )
+    else:
+        accelerator = Accelerator(
+            gradient_accumulation_steps=grad_accum_steps,
+            mixed_precision="bf16",
+        )
+    tb_writer = None
+    if SummaryWriter is not None and accelerator.is_main_process:
+        tb_log_dir = Path(args.output_model_path) / "tb"
+        tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
+
+    def _find_latest_checkpoint(output_dir: str):
+        root = Path(output_dir)
+        if not root.exists():
+            return None, None
+        candidates = []
+        for item in root.iterdir():
+            if item.is_dir():
+                m = re.match(r"checkpoint-epoch-(\d+)$", item.name)
+                if m:
+                    candidates.append((int(m.group(1)), item))
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[-1][1], candidates[-1][0]
+
+    start_epoch = 0
+    global_step = 0
+    resume_checkpoint = None
+    MODEL_PATH = args.init_model_path
+    if args.resume:
+        latest_ckpt, latest_epoch = _find_latest_checkpoint(args.output_model_path)
+        if latest_ckpt is not None:
+            MODEL_PATH = str(latest_ckpt)
+            start_epoch = latest_epoch + 1
+            resume_checkpoint = str(latest_ckpt)
+
+    attn_impl = "flash_attention_2" if args.flash_attn else "eager"
+    AutoConfig.register("qwen3_tts", Qwen3TTSConfig)
+    config_override = None
+    config_path = Path(MODEL_PATH) / "config.json"
+    if config_path.exists():
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
-
-    return cfg
-
-
-def get_talker_inner(model, use_lora: bool):
-    """Trả về (talker_for_cond, talker_inner, talker_cond) theo đúng path
-    cho cả LoRA và full finetune.
-
-    BUG FIX: code gốc luôn dùng .base_model.model ngay cả khi không có LoRA
-    → AttributeError khi use_lora=False.
-    """
-    if use_lora:
-        # PeftModel wraps: model.talker.base_model.model = Qwen3TTSTalker
-        talker_for_cond = model.talker.base_model.model
-    else:
-        # Raw talker = Qwen3TTSTalker trực tiếp
-        talker_for_cond = model.talker
-
-    talker_inner = talker_for_cond.model           # Qwen3TTSTalkerModel (text_embedding, codec_embedding)
-    talker_cond  = talker_for_cond.code_predictor  # CodePredictor (sub-talker)
-    return talker_for_cond, talker_inner, talker_cond
-
-
-def build_input_embeddings(
-    input_ids, codec_ids, ref_mels, codec_mask,
-    text_embedding_mask, codec_embedding_mask,
-    talker_for_cond, talker_inner, talker_cond,
-    speaker_encoder, device,
-):
-    """Xây dựng input_embeddings và lấy speaker_embedding.
-
-    BUG FIX #2 (text_projection, PR #188):
-    Official code bỏ qua bước text_projection ở training, trong khi inference
-    luôn dùng nó → train/inference mismatch → embedding sai.
-    Fix: gọi text_projection nếu layer đó tồn tại.
-
-    Stage 1 vs Stage 2:
-    Stage 1: mỗi sample có ref_audio riêng (multi-speaker)
-             → speaker_embedding thay đổi theo từng sample trong batch.
-    Stage 2: toàn bộ dataset dùng một ref_audio cố định
-             → speaker_embedding là hằng số.
-    """
-    with torch.no_grad():
-        # Lấy speaker embedding từ ref_mel của mỗi sample trong batch
-        raw = speaker_encoder(ref_mels.to(device).to(torch.bfloat16))
-
-        # BUG FIX: speaker_encoder có thể trả về tuple HOẶC tensor trực tiếp.
-        # - Nếu trả tuple (tensor, ...): [0] → [B, D] ✓
-        # - Nếu trả tensor [B, D] trực tiếp: [0] → [D] (chỉ sample đầu!) ✗
-        #   → for loop chạy theo dim D (~512) thay vì dim B (~4) → IndexError
-        # Fix: kiểm tra kiểu trả về, sau đó đảm bảo shape luôn là [B, D].
-        if isinstance(raw, (tuple, list)):
-            spk = raw[0].detach()   # tuple → lấy phần tử đầu: [B, D]
-        else:
-            spk = raw.detach()      # tensor trực tiếp: [B, D]
-
-        # Đảm bảo shape [B, D] bất kể encoder trả về gì
-        B = input_ids.shape[0]
-        if spk.dim() == 1:
-            # [D] → expand thành [B, D] (một embedding cho tất cả batch items)
-            spk = spk.unsqueeze(0).expand(B, -1)
-        elif spk.dim() == 3:
-            # [B, T, D] → pool theo T → [B, D]
-            spk = spk.mean(dim=1)
-        # spk.shape == [B, D] ✓
-
-        speaker_embedding = spk  # [B, D]
-
-    # Text embedding
-    input_text_embedding = talker_inner.text_embedding(input_ids[:, :, 0])
-
-    # BUG FIX #2: Apply text_projection nếu có (đã merge vào upstream commit 680d4e9)
-    # Nếu checkpoint chưa có fix này, lệnh below vẫn an toàn nhờ hasattr check
-    if hasattr(talker_for_cond, "text_projection") and talker_for_cond.text_projection is not None:
-        input_text_embedding = talker_for_cond.text_projection(input_text_embedding)
-
-    input_text_embedding = input_text_embedding * text_embedding_mask
-
-    # Codec embedding
-    input_codec_embedding = talker_inner.codec_embedding(input_ids[:, :, 1]) * codec_embedding_mask
-
-    # Căn chỉnh hidden size (0.6B vs 1.7B có hidden size khác nhau)
-    talker_hidden_size = input_codec_embedding.shape[-1]
-    if input_text_embedding.shape[-1] != talker_hidden_size:
-        input_text_embedding = input_text_embedding[..., :talker_hidden_size]
-
-    # Inject speaker embedding tại vị trí 6 trong sequence (speaker conditioning slot)
-    # Dùng direct slice assignment thay vì for loop:
-    #   input_codec_embedding[:, 6, :] là [B, D]
-    #   speaker_embedding là [B, D]
-    #   → mỗi sample nhận đúng embedding của mình, không cần vòng lặp
-    input_codec_embedding[:, 6, :] = speaker_embedding.to(input_codec_embedding.dtype)
-
-    # Kết hợp text + codec embeddings
-    input_embeddings = input_text_embedding + input_codec_embedding
-
-    # Thêm codec residual embeddings từ sub-talker (tracks 1-15)
-    for i in range(1, 16):
-        codec_i_emb = talker_cond.get_input_embeddings()[i - 1](codec_ids[:, :, i])
-        codec_i_emb = codec_i_emb * codec_mask.unsqueeze(-1)
-        if input_embeddings.shape[-1] != codec_i_emb.shape[-1]:
-            pad = input_embeddings.shape[-1] - codec_i_emb.shape[-1]
-            codec_i_emb = F.pad(codec_i_emb, (0, pad))
-        input_embeddings = input_embeddings + codec_i_emb
-
-    return input_embeddings, speaker_embedding
-
-
-def compute_loss(
-    model, input_embeddings, attention_mask, codec_0_labels,
-    codec_ids, codec_mask, talker_for_cond, talker_cond,
-    sub_talker_loss_weight, use_lora,
-):
-    """Tính loss với BUG FIX #1 (double label-shift, PR #178).
-
-    Official sft_12hz.py:
-        model.talker(inputs_embeds=emb[:, :-1], labels=labels[:, 1:])
-        → HF ForCausalLMLoss shift thêm lần nữa → predictions lệch 2 token
-        → giọng đọc nhanh dần sau mỗi epoch.
-
-    Fix: KHÔNG truyền labels= vào model.talker().
-         Thay vào đó, lấy logits rồi dùng F.cross_entropy với single shift.
-    """
-    outputs = model.talker(
-        inputs_embeds=input_embeddings[:, :-1, :],  # seq-1 tokens làm input
-        attention_mask=attention_mask[:, :-1],
-        output_hidden_states=True,
-        # KHÔNG truyền labels= ở đây để tránh double-shift
-    )
-
-    # BUG FIX #1: Single shift thủ công với F.cross_entropy
-    # logits[i] dự đoán token[i+1], nên so với labels[1:]
-    logits  = outputs.logits                  # [B, seq-1, vocab_size]
-    targets = codec_0_labels[:, 1:].long()    # [B, seq-1]
-
-    main_loss = F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
-        targets.reshape(-1),
-        ignore_index=-100,
-    )
-
-    # Sub-talker loss (codec residuals 1-15)
-    # Qwen3TTS talker trả về hidden_states với cấu trúc LỒNG NHAU:
-    #   outputs.hidden_states    = (inner_tuple, None, ...)
-    #   outputs.hidden_states[0] = (emb, layer1, ..., last_layer)  ← tuple các layer
-    #   outputs.hidden_states[-1]= None  ← đây là lý do crash!
-    # Fix: dùng [0][-1] để lấy last layer của inner tuple, shape [B, seq-1, hidden]
-    inner = outputs.hidden_states[0]   # tuple các layer hidden states
-    if isinstance(inner, (tuple, list)):
-        last_hidden = inner[-1]        # last transformer layer [B, seq-1, hidden]
-    else:
-        last_hidden = inner            # fallback nếu không phải tuple
-
-    # BUG FIX: dùng codec_mask[:, :-1] (seq-1) nhất quán với last_hidden
-    talker_hidden_states = last_hidden[codec_mask[:, :-1]]          # [N, hidden]
-    talker_codec_ids     = codec_ids[:, :-1, :][codec_mask[:, :-1]] # [N, 16]
-    # Cả hai đều được mask với codec_mask[:, :-1] → N nhất quán, không crash
-
-    sub_talker_hidden_size = talker_cond.config.hidden_size
-    if talker_hidden_states.shape[-1] != sub_talker_hidden_size:
-        talker_hidden_states = talker_hidden_states[..., :sub_talker_hidden_size]
-
-    _, sub_talker_loss = talker_for_cond.forward_sub_talker_finetune(
-        talker_codec_ids, talker_hidden_states
-    )
-
-    total_loss = main_loss + sub_talker_loss_weight * sub_talker_loss
-    return total_loss, main_loss, sub_talker_loss
-
-
-def save_checkpoint(
-    accelerator, model, optimizer, scheduler,
-    args, config_dict, epoch, global_step, best_val_loss,
-):
-    """Lưu checkpoint sau mỗi epoch.
-
-    Lưu 2 thứ:
-      - model.safetensors : model weights cho inference
-      - training_state.pt : optimizer + scheduler + step cho resume training
-    """
-    output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch}")
-    os.makedirs(output_dir, exist_ok=True)
-    shutil.copytree(args.init_model_path, output_dir, dirs_exist_ok=True)
-
-    cfg = dict(config_dict)
-    cfg["tts_model_type"] = "base"
-    cfg["stage1_vi"] = True
-    with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-
-    unwrapped = accelerator.unwrap_model(model)
-    state_dict = {
-        k: v.detach().cpu()
-        for k, v in unwrapped.state_dict().items()
-        if not k.startswith("speaker_encoder")
-    }
-    save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
-
-    # Lưu training state để resume đúng cách (optimizer + scheduler + step)
-    # Thiếu phần này → khi resume optimizer khởi động lại từ đầu (mất momentum/variance)
-    training_state = {
-        "epoch":                epoch,
-        "global_step":          global_step,
-        "best_val_loss":        best_val_loss,
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "args_lr":              args.lr,
-    }
-    torch.save(training_state, os.path.join(output_dir, "training_state.pt"))
-
-    accelerator.print(f"[Checkpoint] Epoch {epoch}, step {global_step} -> {output_dir}")
-    return output_dir
-
-
-def run_validation(model, val_dataloader, speaker_encoder, args, accelerator):
-    """Chạy validation và trả về avg loss."""
-    model.eval()
-    total_val_loss = 0.0
-    steps = 0
-
-    with torch.no_grad():
-        for batch in val_dataloader:
-            _model = accelerator.unwrap_model(model)
-            talker_for_cond, talker_inner, talker_cond = get_talker_inner(
-                _model, use_lora=False  # Stage 1 = full finetuning
-            )
-
-            input_embeddings, _ = build_input_embeddings(
-                input_ids=batch["input_ids"],
-                codec_ids=batch["codec_ids"],
-                ref_mels=batch["ref_mels"],
-                codec_mask=batch["codec_mask"],
-                text_embedding_mask=batch["text_embedding_mask"],
-                codec_embedding_mask=batch["codec_embedding_mask"],
-                talker_for_cond=talker_for_cond,
-                talker_inner=talker_inner,
-                talker_cond=talker_cond,
-                speaker_encoder=speaker_encoder,
-                device=accelerator.device,
-            )
-
-            loss, _, _ = compute_loss(
-                model=model,
-                input_embeddings=input_embeddings,
-                attention_mask=batch["attention_mask"],
-                codec_0_labels=batch["codec_0_labels"],
-                codec_ids=batch["codec_ids"],
-                codec_mask=batch["codec_mask"],
-                talker_for_cond=talker_for_cond,
-                talker_cond=talker_cond,
-                sub_talker_loss_weight=args.sub_talker_loss_weight,
-                use_lora=False,
-            )
-            total_val_loss += loss.item()
-            steps += 1
-
-    model.train()
-    return total_val_loss / max(steps, 1)
-
-
-# ──────────────────────────────────────────────────────────────
-# Main training loop
-# ──────────────────────────────────────────────────────────────
-def train():
-    args = parse_args()
-    set_seed(args.seed)
-
-    accelerator = Accelerator(
-        gradient_accumulation_steps=args.grad_accum_steps,
-        mixed_precision="bf16",
-        log_with="tensorboard",
-        project_dir="./logs_stage1_vi",
-    )
-    accelerator.print("=" * 60)
-    accelerator.print("Stage 1: Vietnamese TTS Language Learning")
-    accelerator.print(f"  Model : {args.init_model_path}")
-    accelerator.print(f"  LR    : {args.lr}  (validated: 2e-5 gây noise)")
-    accelerator.print(f"  Epochs: {args.num_epochs}")
-    accelerator.print(f"  Eff. batch: {args.batch_size} x {args.grad_accum_steps} "
-                      f"= {args.batch_size * args.grad_accum_steps}")
-    accelerator.print("=" * 60)
-
-    # ── 1. Load model ────────────────────────────────────────────
-    config_dict = patch_and_load_config(args.init_model_path, accelerator)
-
+        if cfg.get("tts_model_type") != "base":
+            config_override = AutoConfig.from_pretrained(MODEL_PATH)
+            config_override.tts_model_type = "base"
     qwen3tts = Qwen3TTSModel.from_pretrained(
-        args.init_model_path,
-        dtype=torch.bfloat16,
-        attn_implementation=args.attn_impl,
+        MODEL_PATH,
+        torch_dtype=torch.bfloat16,
+        attn_implementation=attn_impl,
+        config=config_override,
     )
-    config = AutoConfig.from_pretrained(args.init_model_path)
+    config = config_override or AutoConfig.from_pretrained(MODEL_PATH)
 
-    # ── 2. Freeze speaker_encoder ────────────────────────────────
-    # Speaker encoder đã được pretrain tốt, không cần train lại cho Stage 1
-    speaker_encoder = qwen3tts.model.speaker_encoder
-    assert speaker_encoder is not None, (
-        "speaker_encoder là None! Kiểm tra tts_model_type=base trong config."
-    )
-    speaker_encoder.eval()
-    for p in speaker_encoder.parameters():
-        p.requires_grad = False
+    train_jsonl_path = Path(args.train_jsonl)
+    train_base_dir = train_jsonl_path.parent
 
-    # ── 3. Unfreeze talker (học ngôn ngữ = train toàn bộ talker) ─
-    # Stage 1 dùng full finetuning (không LoRA) để học tiếng Việt tốt nhất.
-    # Đặc biệt: text_embedding PHẢI được train để học từ vựng tiếng Việt.
-    for p in qwen3tts.model.talker.parameters():
-        p.requires_grad = True
+    train_data = open(args.train_jsonl).readlines()
+    train_data = [json.loads(line) for line in train_data]
+    for item in train_data:
+        for key in ("audio", "ref_audio"):
+            if key in item and item[key]:
+                path = Path(item[key])
+                if not path.is_absolute():
+                    candidate = train_base_dir / path
+                    if candidate.exists():
+                        path = candidate
+                item[key] = str(path)
 
-    total     = sum(p.numel() for p in qwen3tts.model.parameters())
-    trainable = sum(p.numel() for p in qwen3tts.model.parameters() if p.requires_grad)
-    accelerator.print(
-        f"[Model] Total: {total/1e6:.1f}M | "
-        f"Trainable: {trainable/1e6:.1f}M ({100*trainable/total:.2f}%)"
-    )
+        ref_audio = item.get("ref_audio")
+        audio = item.get("audio")
+        if ref_audio and audio:
+            ref_audio_path = Path(ref_audio)
+            if not ref_audio_path.exists():
+                audio_parent = Path(audio).parent
+                fallback = audio_parent / ref_audio_path
+                if fallback.exists():
+                    item["ref_audio"] = str(fallback)
+    dataset = TTSDataset(train_data, qwen3tts.processor, config)
+    train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
-    # ── 4. Dataset & DataLoader ──────────────────────────────────
-    def load_jsonl(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return [json.loads(line) for line in f if line.strip()]
-
-    train_data = load_jsonl(args.train_jsonl)
-    accelerator.print(f"[Data] Train samples: {len(train_data)}")
-
-    # Kiểm tra format JSONL
-    sample = train_data[0]
-    assert "text" in sample and "audio" in sample and "ref_audio" in sample, (
-        "Mỗi dòng JSONL cần có: 'text', 'audio', 'ref_audio'. "
-        f"Dòng đầu tiên chỉ có: {list(sample.keys())}"
-    )
-
-    dataset    = TTSDataset(train_data, qwen3tts.processor, config)
-    train_dl   = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=dataset.collate_fn,
-        num_workers=args.num_workers,
-        pin_memory=True,
+    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / grad_accum_steps)
+    max_train_steps = args.num_epochs * num_update_steps_per_epoch
+    warmup_steps = args.warmup_steps
+    if args.warmup_ratio and args.warmup_ratio > 0:
+        warmup_steps = int(max_train_steps * args.warmup_ratio)
+    lr_scheduler = get_scheduler(
+        name=args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=max_train_steps,
     )
 
-    val_dl = None
-    if args.val_jsonl and os.path.exists(args.val_jsonl):
-        val_data = load_jsonl(args.val_jsonl)
-        val_ds   = TTSDataset(val_data, qwen3tts.processor, config)
-        val_dl   = DataLoader(
-            val_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            collate_fn=val_ds.collate_fn,
-            num_workers=args.num_workers,
-            pin_memory=True,
-        )
-        accelerator.print(f"[Data] Val samples  : {len(val_data)}")
-    else:
-        accelerator.print("[Data] Val: không có (khuyến khích thêm để theo dõi overfitting)")
-
-    # ── 5. Optimizer + Scheduler ─────────────────────────────────
-    optimizer = AdamW(
-        filter(lambda p: p.requires_grad, qwen3tts.model.parameters()),
-        lr=args.lr,
-        weight_decay=0.01,
-        betas=(0.9, 0.98),
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        qwen3tts.model, optimizer, train_dataloader, lr_scheduler
     )
 
-    total_update_steps = (len(train_dl) * args.num_epochs) // args.grad_accum_steps
-    cosine_steps       = max(1, total_update_steps - args.warmup_steps)
-    scheduler          = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=args.lr * 0.1)
+    if args.resume and resume_checkpoint is not None:
+        trainer_state_path = os.path.join(resume_checkpoint, "trainer_state.json")
+        optimizer_state_path = os.path.join(resume_checkpoint, "optimizer.pt")
+        scheduler_state_path = os.path.join(resume_checkpoint, "scheduler.pt")
+        if os.path.exists(trainer_state_path):
+            with open(trainer_state_path, "r", encoding="utf-8") as f:
+                trainer_state = json.load(f)
+            start_epoch = max(start_epoch, int(trainer_state.get("next_epoch", start_epoch)))
+            global_step = int(trainer_state.get("global_step", 0))
+        if os.path.exists(optimizer_state_path):
+            optimizer_state = torch.load(optimizer_state_path, map_location="cpu")
+            try:
+                optimizer.load_state_dict(optimizer_state)
+            except Exception:
+                accelerator.print("Warning: failed to load optimizer state; continuing with fresh optimizer.")
+        if os.path.exists(scheduler_state_path):
+            scheduler_state = torch.load(scheduler_state_path, map_location="cpu")
+            try:
+                lr_scheduler.load_state_dict(scheduler_state)
+            except Exception:
+                accelerator.print("Warning: failed to load scheduler state; continuing with fresh scheduler.")
 
-    # ── 6. Accelerate prepare ────────────────────────────────────
-    prepare_args = [qwen3tts.model, optimizer, train_dl, scheduler]
-    if val_dl:
-        prepare_args.append(val_dl)
-
-    prepared = accelerator.prepare(*prepare_args)
-
-    if val_dl:
-        model, optimizer, train_dl, scheduler, val_dl = prepared
-    else:
-        model, optimizer, train_dl, scheduler = prepared
-
-    # speaker_encoder không qua accelerator.prepare (frozen, chỉ cần .to(device))
-    speaker_encoder = speaker_encoder.to(accelerator.device)
+    num_epochs = args.num_epochs
     model.train()
 
-    global_step = 0
-    best_val_loss = float("inf")
-    resume_epoch = 0
+    def _save_checkpoint(epoch_idx: int):
+        output_dir = os.path.join(args.output_model_path, f"checkpoint-epoch-{epoch_idx}")
+        shutil.copytree(MODEL_PATH, output_dir, dirs_exist_ok=True)
 
-    # ── 6b. Resume từ checkpoint (load optimizer + scheduler + step) ──
-    if args.resume_from_checkpoint:
-        state_path = os.path.join(args.resume_from_checkpoint, "training_state.pt")
-        if os.path.exists(state_path):
-            state = torch.load(state_path, map_location="cpu")
-            resume_epoch  = state["epoch"] + 1          # bắt đầu từ epoch kế tiếp
-            global_step   = state["global_step"]
-            best_val_loss = state.get("best_val_loss", float("inf"))
-            optimizer.load_state_dict(state["optimizer_state_dict"])
-            scheduler.load_state_dict(state["scheduler_state_dict"])
-            accelerator.print(
-                f"[Resume] Loaded checkpoint từ {args.resume_from_checkpoint} | "
-                f"epoch={state['epoch']}, step={global_step}, "
-                f"best_val={best_val_loss:.4f}, saved_lr={state.get('args_lr', '?')}"
-            )
-        else:
-            accelerator.print(
-                f"[Resume] Không tìm thấy training_state.pt trong {args.resume_from_checkpoint}. "
-                "Chỉ dùng model weights (optimizer sẽ khởi động từ đầu)."
-            )
+        input_config_file = os.path.join(MODEL_PATH, "config.json")
+        output_config_file = os.path.join(output_dir, "config.json")
+        with open(input_config_file, 'r', encoding='utf-8') as f:
+            config_dict = json.load(f)
+        config_dict["tts_model_type"] = "custom_voice"
+        talker_config = config_dict.get("talker_config", {})
+        talker_config["spk_id"] = {
+            args.speaker_name: 3000
+        }
+        talker_config["spk_is_dialect"] = {
+            args.speaker_name: False
+        }
+        config_dict["talker_config"] = talker_config
 
-    # Unwrap một lần ngoài loop để tối ưu hiệu năng
-    _model = accelerator.unwrap_model(model)
-    talker_for_cond, talker_inner, talker_cond = get_talker_inner(_model, use_lora=False)
+        with open(output_config_file, 'w', encoding='utf-8') as f:
+            json.dump(config_dict, f, indent=2, ensure_ascii=False)
 
-    # ── 7. Training loop ─────────────────────────────────────────
-    for epoch in range(resume_epoch, args.num_epochs):
-        model.train()
-        ep_total = ep_main = ep_sub = 0.0
+        unwrapped_model = accelerator.unwrap_model(model)
+        state_dict = {k: v.detach().to("cpu") for k, v in unwrapped_model.state_dict().items()}
 
-        for step, batch in enumerate(train_dl):
+        weight = state_dict['talker.model.codec_embedding.weight']
+        state_dict['talker.model.codec_embedding.weight'][3000] = target_speaker_embedding[0].detach().to(weight.device).to(weight.dtype)
+        save_path = os.path.join(output_dir, "model.safetensors")
+        save_file(state_dict, save_path)
+
+        optimizer_state_path = os.path.join(output_dir, "optimizer.pt")
+        torch.save(optimizer.state_dict(), optimizer_state_path)
+        scheduler_state_path = os.path.join(output_dir, "scheduler.pt")
+        torch.save(lr_scheduler.state_dict(), scheduler_state_path)
+        trainer_state_path = os.path.join(output_dir, "trainer_state.json")
+        with open(trainer_state_path, "w", encoding="utf-8") as f:
+            json.dump({"next_epoch": epoch_idx + 1, "global_step": global_step}, f, indent=2)
+
+
+    for epoch in range(start_epoch, num_epochs):
+        for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(model):
 
-                input_embeddings, _ = build_input_embeddings(
-                    input_ids=batch["input_ids"],
-                    codec_ids=batch["codec_ids"],
-                    ref_mels=batch["ref_mels"],
-                    codec_mask=batch["codec_mask"],
-                    text_embedding_mask=batch["text_embedding_mask"],
-                    codec_embedding_mask=batch["codec_embedding_mask"],
-                    talker_for_cond=talker_for_cond,
-                    talker_inner=talker_inner,
-                    talker_cond=talker_cond,
-                    speaker_encoder=speaker_encoder,
-                    device=accelerator.device,
+                input_ids = batch['input_ids']
+                codec_ids = batch['codec_ids']
+                ref_mels = batch['ref_mels']
+                text_embedding_mask = batch['text_embedding_mask']
+                codec_embedding_mask = batch['codec_embedding_mask']
+                attention_mask = batch['attention_mask']
+                codec_0_labels = batch['codec_0_labels']
+                codec_mask = batch['codec_mask']
+
+                speaker_embedding = model.speaker_encoder(ref_mels.to(model.device).to(model.dtype)).detach()
+                if target_speaker_embedding is None:
+                    target_speaker_embedding = speaker_embedding
+
+                input_text_ids = input_ids[:, :, 0]
+                input_codec_ids = input_ids[:, :, 1]
+
+                input_text_embedding = model.talker.text_projection(
+                    model.talker.model.text_embedding(input_text_ids)
+                ) * text_embedding_mask
+                input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
+                input_codec_embedding[:, 6, :] = speaker_embedding
+
+                input_embeddings = input_text_embedding + input_codec_embedding
+
+                for i in range(1, 16):
+                    codec_i_embedding = model.talker.code_predictor.get_input_embeddings()[i - 1](codec_ids[:, :, i])
+                    codec_i_embedding = codec_i_embedding * codec_mask.unsqueeze(-1)
+                    input_embeddings = input_embeddings + codec_i_embedding
+
+                outputs = model.talker(
+                    inputs_embeds=input_embeddings[:, :-1, :],
+                    attention_mask=attention_mask[:, :-1],
+                    labels=codec_0_labels[:, 1:],
+                    output_hidden_states=True
                 )
 
-                loss, main_loss, sub_loss = compute_loss(
-                    model=model,
-                    input_embeddings=input_embeddings,
-                    attention_mask=batch["attention_mask"],
-                    codec_0_labels=batch["codec_0_labels"],
-                    codec_ids=batch["codec_ids"],
-                    codec_mask=batch["codec_mask"],
-                    talker_for_cond=talker_for_cond,
-                    talker_cond=talker_cond,
-                    sub_talker_loss_weight=args.sub_talker_loss_weight,
-                    use_lora=False,
-                )
+                hidden_states = outputs.hidden_states[0][-1]
+                talker_hidden_states = hidden_states[codec_mask[:, 1:]]
+                talker_codec_ids = codec_ids[codec_mask]
+
+                sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
+
+                loss = outputs.loss + sub_talker_loss
 
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
-                        filter(lambda p: p.requires_grad, model.parameters()),
-                        args.max_grad_norm,
-                    )
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+
+                if accelerator.sync_gradients:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
                     global_step += 1
 
-                    # LR warmup → cosine decay
-                    if global_step <= args.warmup_steps:
-                        warmup_lr = args.lr * global_step / max(args.warmup_steps, 1)
-                        for pg in optimizer.param_groups:
-                            pg["lr"] = warmup_lr
-                    else:
-                        scheduler.step()
+            if step % args.log_interval == 0:
+                accelerator.print(f"Epoch {epoch} | Step {step} | Loss: {loss.item():.4f}")
+                if tb_writer is not None:
+                    tb_writer.add_scalar("train/loss", loss.item(), global_step)
+                    tb_writer.add_scalar("train/lr", lr_scheduler.get_last_lr()[0], global_step)
 
-                optimizer.step()
-                optimizer.zero_grad()
+        if accelerator.is_main_process and (epoch % args.save_interval == 0):
+            _save_checkpoint(epoch)
 
-            ep_total += loss.item()
-            ep_main  += main_loss.item()
-            ep_sub   += sub_loss.item()
+    if accelerator.is_main_process and args.save_last:
+        final_epoch = num_epochs - 1
+        if final_epoch >= start_epoch and (final_epoch % args.save_interval != 0):
+            _save_checkpoint(final_epoch)
 
-            if step % 20 == 0:
-                cur_lr = optimizer.param_groups[0]["lr"]
-                accelerator.print(
-                    f"[E{epoch} S{step}/{len(train_dl)}] "
-                    f"loss={loss.item():.4f} "
-                    f"(main={main_loss.item():.4f} sub={sub_loss.item():.4f}) "
-                    f"lr={cur_lr:.2e}"
-                )
-
-        n = len(train_dl)
-        accelerator.print(
-            f"[Epoch {epoch}] Train avg — "
-            f"total={ep_total/n:.4f}  main={ep_main/n:.4f}  sub={ep_sub/n:.4f}"
-        )
-
-        # Validation
-        if val_dl:
-            val_loss = run_validation(model, val_dl, speaker_encoder, args, accelerator)
-            accelerator.print(f"[Epoch {epoch}] Val loss = {val_loss:.4f}")
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                accelerator.print(f"  ✓ Best val loss improved → {val_loss:.4f}")
-            elif val_loss > best_val_loss * 1.05:
-                accelerator.print(
-                    f"  ⚠ Val loss tăng ({val_loss:.4f} > {best_val_loss:.4f} * 1.05). "
-                    "Cân nhắc early stopping."
-                )
-
-        # Save checkpoint
-        if accelerator.is_main_process and (epoch + 1) % args.save_every_n_epochs == 0:
-            ckpt = save_checkpoint(
-                accelerator, model, optimizer, scheduler,
-                args, config_dict, epoch, global_step, best_val_loss,
-            )
-            accelerator.print(f"[Save] Checkpoint saved: {ckpt}")
-
-    # Save final checkpoint
-    if accelerator.is_main_process:
-        ckpt = save_checkpoint(
-            accelerator, model, optimizer, scheduler,
-            args, config_dict, epoch="final", global_step=global_step,
-            best_val_loss=best_val_loss,
-        )
-        accelerator.print(f"[Done] Final checkpoint: {ckpt}")
-
-    accelerator.print("Stage 1 training complete.")
-    accelerator.print(
-        "Tiếp theo: dùng checkpoint tốt nhất làm --init_model_path cho Stage 2 (clone voice)."
-    )
-
+    if tb_writer is not None:
+        tb_writer.flush()
+        tb_writer.close()
 
 if __name__ == "__main__":
     train()
