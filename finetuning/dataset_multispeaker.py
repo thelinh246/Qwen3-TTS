@@ -161,7 +161,24 @@ class TTSDataset(Dataset):
             codec_mask[i, 8 + text_ids_len - 1:8 + text_ids_len - 1 + codec_ids_len] = True
             attention_mask[i, :8 + text_ids_len + codec_ids_len] = True
 
-        ref_mels = torch.cat([data["ref_mel"] for data in batch], dim=0)
+        # Multi-speaker batches can contain different reference-audio lengths.
+        # Each ref_mel is shaped [1, T_ref, 128]. torch.cat(..., dim=0) only
+        # works when all T_ref are identical, which is usually false when each
+        # speaker has its own fixed ref_audio. Pad along the time axis instead.
+        ref_mel_list = [data["ref_mel"] for data in batch]
+        max_ref_len = max(m.shape[1] if m.dim() == 3 else m.shape[0] for m in ref_mel_list)
+        n_mels = ref_mel_list[0].shape[-1]
+        ref_mels = ref_mel_list[0].new_zeros((len(ref_mel_list), max_ref_len, n_mels))
+
+        for i, m in enumerate(ref_mel_list):
+            if m.dim() == 2:
+                # [T_ref, 128] -> [1, T_ref, 128]
+                m = m.unsqueeze(0)
+            if m.shape[0] != 1:
+                raise ValueError(f"Expected ref_mel shape [1, T, 128], got {tuple(m.shape)}")
+            ref_len = m.shape[1]
+            ref_mels[i, :ref_len, :] = m[0]
+
         return {
             "input_ids": input_ids,
             "ref_mels": ref_mels,
