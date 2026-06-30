@@ -18,12 +18,13 @@ import json
 import math
 import os
 import re
+import unicodedata
 import shutil
 from pathlib import Path
 
 import torch
 from accelerate import Accelerator
-from dataset import TTSDataset
+from dataset_vietnamese import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from safetensors.torch import save_file
@@ -41,11 +42,11 @@ def train():
     global target_speaker_embedding
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--init_model_path", type=str, default="Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+    parser.add_argument("--init_model_path", type=str, default="g-group-ai-lab/gwen-tts-0.6B")
     parser.add_argument("--output_model_path", type=str, default="output")
     parser.add_argument("--train_jsonl", type=str, required=True)
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=2e-6)
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--speaker_name", type=str, default="speaker_test")
     parser.add_argument("--save_interval", type=int, default=1, help="Save a checkpoint every N epochs.")
@@ -55,9 +56,9 @@ def train():
     parser.add_argument(
         "--resume/--no-resume",
         dest="resume",
-        default=True,
+        default=False,
         action=argparse.BooleanOptionalAction,
-        help="Resume from the latest checkpoint in output_model_path if available.",
+        help="Resume from the latest checkpoint in output_model_path if available. Keep disabled when switching base checkpoint.",
     )
     parser.add_argument(
         "--accelerate-trackers/--no-accelerate-trackers",
@@ -81,7 +82,12 @@ def train():
         help="Learning rate scheduler type.",
     )
     parser.add_argument("--warmup_steps", type=int, default=0, help="Number of warmup steps.")
-    parser.add_argument("--warmup_ratio", type=float, default=0.0, help="Warmup ratio of total steps (overrides warmup_steps if > 0).")
+    parser.add_argument("--warmup_ratio", type=float, default=0.03, help="Warmup ratio of total steps (overrides warmup_steps if > 0).")
+    parser.add_argument("--language", type=str, default="Vietnamese", help="Language label used during training; for Gwen-TTS use Vietnamese.")
+    parser.add_argument("--normalize_text/--no-normalize_text", dest="normalize_text", default=True, action=argparse.BooleanOptionalAction, help="Apply lightweight NFC + whitespace normalization to transcripts.")
+    parser.add_argument("--freeze_text_understanding/--no-freeze_text_understanding", dest="freeze_text_understanding", default=True, action=argparse.BooleanOptionalAction, help="Freeze text embedding/projection to reduce catastrophic forgetting of Vietnamese reading.")
+    parser.add_argument("--freeze_speaker_encoder/--no-freeze_speaker_encoder", dest="freeze_speaker_encoder", default=True, action=argparse.BooleanOptionalAction, help="Freeze speaker encoder; speaker embedding is still extracted and saved.")
+    parser.add_argument("--sub_talker_loss_weight", type=float, default=0.3, help="Weight for sub-talker loss. 0.3 is safer than 1.0 for small voice fine-tunes.")
     args = parser.parse_args()
 
     accel_logging_dir = args.logging_dir or str(Path(args.output_model_path) / "logs")
@@ -159,9 +165,17 @@ def train():
     train_jsonl_path = Path(args.train_jsonl)
     train_base_dir = train_jsonl_path.parent
 
-    train_data = open(args.train_jsonl).readlines()
+    def _normalize_vi_text(text: str) -> str:
+        text = unicodedata.normalize("NFC", str(text))
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    train_data = open(args.train_jsonl, encoding="utf-8").readlines()
     train_data = [json.loads(line) for line in train_data]
     for item in train_data:
+        item["language"] = args.language
+        if args.normalize_text and "text" in item:
+            item["text"] = _normalize_vi_text(item["text"])
         for key in ("audio", "ref_audio"):
             if key in item and item[key]:
                 path = Path(item[key])
@@ -180,10 +194,28 @@ def train():
                 fallback = audio_parent / ref_audio_path
                 if fallback.exists():
                     item["ref_audio"] = str(fallback)
-    dataset = TTSDataset(train_data, qwen3tts.processor, config)
+    dataset = TTSDataset(train_data, qwen3tts.processor, config, default_language=args.language)
     train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=dataset.collate_fn)
 
-    optimizer = AdamW(qwen3tts.model.parameters(), lr=args.lr, weight_decay=0.01)
+    def _freeze_module(module, name: str):
+        if module is None:
+            accelerator.print(f"Warning: cannot find module to freeze: {name}")
+            return
+        for p in module.parameters():
+            p.requires_grad = False
+        accelerator.print(f"Frozen: {name}")
+
+    if args.freeze_speaker_encoder:
+        _freeze_module(qwen3tts.model.speaker_encoder, "speaker_encoder")
+
+    if args.freeze_text_understanding:
+        # Keep Vietnamese text/token reading stable while adapting speaker/acoustic behavior.
+        _freeze_module(qwen3tts.model.talker.model.text_embedding, "talker.model.text_embedding")
+        _freeze_module(qwen3tts.model.talker.text_projection, "talker.text_projection")
+
+    trainable_params = [p for p in qwen3tts.model.parameters() if p.requires_grad]
+    accelerator.print(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+    optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / grad_accum_steps)
     max_train_steps = args.num_epochs * num_update_steps_per_epoch
     warmup_steps = args.warmup_steps
@@ -260,7 +292,7 @@ def train():
         torch.save(lr_scheduler.state_dict(), scheduler_state_path)
         trainer_state_path = os.path.join(output_dir, "trainer_state.json")
         with open(trainer_state_path, "w", encoding="utf-8") as f:
-            json.dump({"next_epoch": epoch_idx + 1, "global_step": global_step}, f, indent=2)
+            json.dump({"next_epoch": epoch_idx + 1, "global_step": global_step, "init_model_path": args.init_model_path, "language": args.language, "freeze_text_understanding": args.freeze_text_understanding, "sub_talker_loss_weight": args.sub_talker_loss_weight}, f, indent=2)
 
 
     for epoch in range(start_epoch, num_epochs):
@@ -287,7 +319,8 @@ def train():
                     model.talker.model.text_embedding(input_text_ids)
                 ) * text_embedding_mask
                 input_codec_embedding = model.talker.model.codec_embedding(input_codec_ids) * codec_embedding_mask
-                input_codec_embedding[:, 6, :] = speaker_embedding
+                # dataset_vietnamese.py places the explicit language id at pos 5 and the speaker slot at pos 7
+                input_codec_embedding[:, 7, :] = speaker_embedding
 
                 input_embeddings = input_text_embedding + input_codec_embedding
 
@@ -309,7 +342,7 @@ def train():
 
                 sub_talker_logits, sub_talker_loss = model.talker.forward_sub_talker_finetune(talker_codec_ids, talker_hidden_states)
 
-                loss = outputs.loss + sub_talker_loss
+                loss = outputs.loss + args.sub_talker_loss_weight * sub_talker_loss
 
                 accelerator.backward(loss)
 
