@@ -359,7 +359,7 @@ def train():
                 )
 
                 hidden_states = outputs.hidden_states[0][-1]
-                talker_hidden_states = hidden_states[codec_mask[:, 1:]]
+                talker_hidden_states = hidden_states[codec_mask[:, :-1]]
                 talker_codec_ids = codec_ids[codec_mask]
 
                 _, sub_talker_loss = model.talker.forward_sub_talker_finetune(
