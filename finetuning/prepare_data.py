@@ -16,10 +16,11 @@
 
 import argparse
 import json
+from pathlib import Path
 
 from qwen_tts import Qwen3TTSTokenizer
 
-BATCH_INFER_NUM = 512
+BATCH_INFER_NUM = 32
 
 def main():
     parser = argparse.ArgumentParser()
@@ -28,6 +29,9 @@ def main():
     parser.add_argument("--input_jsonl", type=str, required=True)
     parser.add_argument("--output_jsonl", type=str, required=True)
     args = parser.parse_args()
+
+    input_jsonl_path = Path(args.input_jsonl)
+    input_base_dir = input_jsonl_path.parent
 
     tokenizer_12hz = Qwen3TTSTokenizer.from_pretrained(
         args.tokenizer_model_path,
@@ -41,6 +45,17 @@ def main():
     batch_lines = []
     batch_audios = []
     for line in total_lines:
+        audio_path = Path(line["audio"])
+        if not audio_path.is_absolute():
+            audio_path = input_base_dir / audio_path
+        line["audio"] = str(audio_path)
+
+        ref_audio = line.get("ref_audio")
+        if ref_audio:
+            ref_audio_path = Path(ref_audio)
+            if not ref_audio_path.is_absolute():
+                ref_audio_path = input_base_dir / ref_audio_path
+            line["ref_audio"] = str(ref_audio_path)
 
         batch_lines.append(line)
         batch_audios.append(line['audio'])
