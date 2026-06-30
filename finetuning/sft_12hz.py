@@ -24,7 +24,7 @@ from pathlib import Path
 
 import torch
 from accelerate import Accelerator
-from dataset_vietnamese import TTSDataset
+from dataset import TTSDataset
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
 from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
 from safetensors.torch import save_file
